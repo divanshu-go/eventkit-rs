@@ -12,7 +12,7 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{EventsManager, RemindersManager};
+use crate::{AuthorizationStatus, EventsManager, RemindersManager};
 use chrono::{DateTime, Duration, Local, NaiveDateTime, TimeZone};
 
 use rmcp::handler::server::wrapper::Json;
@@ -22,8 +22,35 @@ use rmcp::handler::server::wrapper::Json;
 // ============================================================================
 
 /// Convert an EventKitError into an McpError for tool returns.
+///
+/// Authorization variants get expanded with a remediation hint so the agent
+/// can guide the user to fix the underlying TCC state.
 fn mcp_err(e: &crate::EventKitError) -> McpError {
-    McpError::internal_error(e.to_string(), None)
+    use crate::EventKitError::*;
+    let msg = match e {
+        AuthorizationDenied => {
+            "Reminders/Calendar access denied. Open System Settings → Privacy & Security \
+             and enable access for `eventkit`. If `eventkit` is not listed, run \
+             `tccutil reset Reminders` (or Calendar) in a terminal and retry. \
+             Call `auth_status` to see the current state."
+                .to_string()
+        }
+        AuthorizationRestricted => {
+            "Reminders/Calendar access is restricted by system policy (MDM or parental controls)."
+                .to_string()
+        }
+        AuthorizationNotDetermined => {
+            "Authorization is undetermined and the consent dialog did not fire. \
+             The binary may be missing Info.plist usage strings — rebuild and retry. \
+             Call `auth_status` to see the current state."
+                .to_string()
+        }
+        AuthorizationRequestFailed(detail) => {
+            format!("Authorization request failed: {detail}")
+        }
+        _ => e.to_string(),
+    };
+    McpError::internal_error(msg, None)
 }
 
 fn mcp_invalid(msg: impl std::fmt::Display) -> McpError {
@@ -76,6 +103,171 @@ struct CoordinateOutput {
 }
 
 #[derive(Serialize, JsonSchema)]
+struct AuthStatusOutput {
+    /// One of: "FullAccess", "WriteOnly", "Denied", "NotDetermined", "Restricted"
+    reminders: &'static str,
+    /// One of: "FullAccess", "WriteOnly", "Denied", "NotDetermined", "Restricted"
+    events: &'static str,
+    /// Human-readable next step. Absent when both statuses are FullAccess/WriteOnly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remediation: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum AccessEntity {
+    Reminder,
+    Event,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct RequestAccessRequest {
+    /// Which EventKit entity to request access for.
+    pub entity: AccessEntity,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct RequestAccessOutput {
+    granted: bool,
+    /// Status after the request. One of: "FullAccess", "WriteOnly",
+    /// "Denied", "NotDetermined", "Restricted".
+    status: &'static str,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SetReminderDueTimezoneRequest {
+    pub reminder_id: String,
+    /// IANA zone name, e.g. `"America/Los_Angeles"`. Pass `null`/`""` to clear.
+    pub timezone: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum GeofenceProximity {
+    Enter,
+    Leave,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct GeofenceInput {
+    pub title: String,
+    pub latitude: f64,
+    pub longitude: f64,
+    /// Radius in meters.
+    pub radius_meters: f64,
+    /// Trigger when entering vs leaving the radius.
+    pub proximity: GeofenceProximity,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SetReminderGeofenceRequest {
+    pub reminder_id: String,
+    /// Pass the geofence to attach, or omit/null to clear any existing
+    /// location-based alarm on the reminder.
+    pub geofence: Option<GeofenceInput>,
+}
+
+/// Structured location metadata for an event — title + lat/lng + a display
+/// radius. Unlike `GeofenceInput`, there's no proximity trigger; events use
+/// this for travel-time, map preview, and Siri suggestions.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct StructuredLocationInput {
+    pub title: String,
+    pub latitude: f64,
+    pub longitude: f64,
+    /// Display radius in meters (0 = labeled point with no radius).
+    pub radius_meters: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SetEventAvailabilityRequest {
+    pub event_id: String,
+    /// "busy" | "free" | "tentative" | "unavailable".
+    pub availability: String,
+}
+
+/// Parse an availability string into our `EventAvailability` enum.
+/// Accepts: "busy", "free", "tentative", "unavailable", "not_supported".
+fn parse_availability(s: &str) -> Result<crate::EventAvailability, String> {
+    match s {
+        "busy" => Ok(crate::EventAvailability::Busy),
+        "free" => Ok(crate::EventAvailability::Free),
+        "tentative" => Ok(crate::EventAvailability::Tentative),
+        "unavailable" => Ok(crate::EventAvailability::Unavailable),
+        "not_supported" => Ok(crate::EventAvailability::NotSupported),
+        other => Err(format!(
+            "invalid availability '{other}'. Use busy, free, tentative, unavailable, or not_supported."
+        )),
+    }
+}
+
+/// Parse a span string ("this" | "future") into our `EventSpan` enum.
+/// Defaults to `This` if omitted.
+fn parse_span(s: Option<&str>) -> Result<crate::EventSpan, String> {
+    match s {
+        None | Some("this") => Ok(crate::EventSpan::This),
+        Some("future") => Ok(crate::EventSpan::Future),
+        Some(other) => Err(format!(
+            "invalid span '{other}'. Use \"this\" or \"future\"."
+        )),
+    }
+}
+
+fn auth_status_str(s: AuthorizationStatus) -> &'static str {
+    match s {
+        AuthorizationStatus::NotDetermined => "NotDetermined",
+        AuthorizationStatus::Restricted => "Restricted",
+        AuthorizationStatus::Denied => "Denied",
+        AuthorizationStatus::FullAccess => "FullAccess",
+        AuthorizationStatus::WriteOnly => "WriteOnly",
+    }
+}
+
+fn auth_remediation(reminders: AuthorizationStatus, events: AuthorizationStatus) -> Option<String> {
+    let granted = |s| {
+        matches!(
+            s,
+            AuthorizationStatus::FullAccess | AuthorizationStatus::WriteOnly
+        )
+    };
+    if granted(reminders) && granted(events) {
+        return None;
+    }
+    let worst = |s| match s {
+        AuthorizationStatus::Denied => 3,
+        AuthorizationStatus::Restricted => 2,
+        AuthorizationStatus::NotDetermined => 1,
+        _ => 0,
+    };
+    let pick = if worst(reminders) >= worst(events) {
+        reminders
+    } else {
+        events
+    };
+    Some(match pick {
+        AuthorizationStatus::NotDetermined => {
+            "Call any reminders or calendar tool to trigger the macOS consent dialog. \
+             If no dialog appears, the binary is missing its Info.plist usage strings — \
+             rebuild from a version that embeds them."
+                .into()
+        }
+        AuthorizationStatus::Denied => {
+            "Open System Settings → Privacy & Security → Reminders (and/or Calendar) and \
+             enable access for `eventkit`. If `eventkit` is not listed, run \
+             `tccutil reset Reminders` (or `tccutil reset Calendar`) in a terminal and \
+             retry — that clears the cached denial so the consent dialog can fire again."
+                .into()
+        }
+        AuthorizationStatus::Restricted => {
+            "Access is blocked by an MDM or parental-controls policy. The user cannot \
+             override this from System Settings — an administrator must change the policy."
+                .into()
+        }
+        _ => "Authorization is partially granted; one of reminders/events is not in FullAccess/WriteOnly state.".into(),
+    })
+}
+
+#[derive(Serialize, JsonSchema)]
 struct LocationOutput {
     title: String,
     latitude: f64,
@@ -93,6 +285,15 @@ struct AlarmOutput {
     proximity: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     location: Option<LocationOutput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sound_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+    /// Derived from which optional fields are set: "display" | "audio" |
+    /// "procedure" | "email" | "unknown".
+    alarm_type: String,
 }
 
 impl AlarmOutput {
@@ -111,6 +312,17 @@ impl AlarmOutput {
                 longitude: l.longitude,
                 radius_meters: l.radius,
             }),
+            email_address: a.email_address.clone(),
+            sound_name: a.sound_name.clone(),
+            url: a.url.clone(),
+            alarm_type: match a.alarm_type {
+                crate::AlarmType::Display => "display",
+                crate::AlarmType::Audio => "audio",
+                crate::AlarmType::Procedure => "procedure",
+                crate::AlarmType::Email => "email",
+                crate::AlarmType::Unknown => "unknown",
+            }
+            .into(),
         }
     }
 }
@@ -125,6 +337,14 @@ struct RecurrenceRuleOutput {
     days_of_week: Option<Vec<u8>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     days_of_month: Option<Vec<i32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    months_of_year: Option<Vec<i32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    weeks_of_year: Option<Vec<i32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    days_of_year: Option<Vec<i32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    set_positions: Option<Vec<i32>>,
     end: RecurrenceEndOutput,
 }
 
@@ -154,6 +374,10 @@ impl RecurrenceRuleOutput {
             interval: r.interval,
             days_of_week: r.days_of_week.clone(),
             days_of_month: r.days_of_month.clone(),
+            months_of_year: r.months_of_year.clone(),
+            weeks_of_year: r.weeks_of_year.clone(),
+            days_of_year: r.days_of_year.clone(),
+            set_positions: r.set_positions.clone(),
             end: match &r.end {
                 crate::RecurrenceEndCondition::Never => RecurrenceEndOutput::Never,
                 crate::RecurrenceEndCondition::AfterCount(n) => {
@@ -188,6 +412,7 @@ impl AttendeeOutput {
 }
 
 #[derive(Serialize, JsonSchema)]
+#[allow(non_snake_case)]
 struct ReminderOutput {
     id: String,
     title: String,
@@ -206,13 +431,30 @@ struct ReminderOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     notes: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    url: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    tags: Vec<String>,
+    URL: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    location: Option<String>,
+    /// IANA zone applied to the due date specifically (separate from the
+    /// item-level timezone). Lets a reminder fire at the same wall-clock
+    /// time regardless of the device's current zone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    due_date_timezone: Option<String>,
+    /// Geofence attached via a location-based alarm.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    geofence: Option<LocationOutput>,
+    /// Parent reminder identifier when this is a subtask.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_id: Option<String>,
+    #[serde(skip_serializing_if = "is_zero")]
+    attachments_count: usize,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     alarms: Vec<AlarmOutput>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     recurrence_rules: Vec<RecurrenceRuleOutput>,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 impl ReminderOutput {
@@ -238,7 +480,6 @@ impl ReminderOutput {
             vec![]
         };
         Self {
-            tags: r.notes.as_deref().map(extract_tags).unwrap_or_default(),
             alarms,
             recurrence_rules,
             ..Self::from_item_summary(r)
@@ -257,8 +498,17 @@ impl ReminderOutput {
             start_date: r.start_date.map(|d| d.to_rfc3339()),
             completion_date: r.completion_date.map(|d| d.to_rfc3339()),
             notes: r.notes.clone(),
-            url: r.url.clone(),
-            tags: r.notes.as_deref().map(extract_tags).unwrap_or_default(),
+            URL: r.URL.clone(),
+            location: r.location.clone(),
+            due_date_timezone: r.due_date_timezone.clone(),
+            geofence: r.structured_location.as_ref().map(|s| LocationOutput {
+                title: s.title.clone(),
+                latitude: s.latitude,
+                longitude: s.longitude,
+                radius_meters: s.radius,
+            }),
+            parent_id: r.parent_id.clone(),
+            attachments_count: r.attachments_count,
             alarms: vec![],
             recurrence_rules: vec![],
         }
@@ -266,6 +516,7 @@ impl ReminderOutput {
 }
 
 #[derive(Serialize, JsonSchema)]
+#[allow(non_snake_case)]
 struct EventOutput {
     id: String,
     title: String,
@@ -281,7 +532,7 @@ struct EventOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     location: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    url: Option<String>,
+    URL: Option<String>,
     availability: String,
     status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -297,6 +548,18 @@ struct EventOutput {
     is_detached: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     occurrence_date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    creation_date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_modified_date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    external_identifier: Option<String>,
+    /// Item-level timezone hint (`EKCalendarItem.timeZone`), distinct from
+    /// the timezone applied to `start` / `end`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timezone: Option<String>,
+    #[serde(skip_serializing_if = "is_zero")]
+    attachments_count: usize,
 }
 
 impl EventOutput {
@@ -331,7 +594,7 @@ impl EventOutput {
             calendar_id: e.calendar_id.clone(),
             notes: e.notes.clone(),
             location: e.location.clone(),
-            url: e.url.clone(),
+            URL: e.URL.clone(),
             availability: match e.availability {
                 crate::EventAvailability::Busy => "busy",
                 crate::EventAvailability::Free => "free",
@@ -359,6 +622,11 @@ impl EventOutput {
             organizer: e.organizer.as_ref().map(AttendeeOutput::from_info),
             is_detached: e.is_detached,
             occurrence_date: e.occurrence_date.map(|d| d.to_rfc3339()),
+            creation_date: e.creation_date.map(|d| d.to_rfc3339()),
+            last_modified_date: e.last_modified_date.map(|d| d.to_rfc3339()),
+            external_identifier: e.external_identifier.clone(),
+            timezone: e.timezone.clone(),
+            attachments_count: e.attachments_count,
         }
     }
 }
@@ -376,6 +644,12 @@ struct CalendarOutput {
     is_immutable: bool,
     is_subscribed: bool,
     entity_types: Vec<String>,
+    /// Which `availability` values this calendar accepts on its events:
+    /// subset of `["busy", "free", "tentative", "unavailable"]`. Empty
+    /// when the calendar holds reminders only, or for source backends that
+    /// report `EKCalendarEventAvailabilityNone`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    supported_event_availabilities: Vec<String>,
 }
 
 impl CalendarOutput {
@@ -393,6 +667,7 @@ impl CalendarOutput {
             is_immutable: c.is_immutable,
             is_subscribed: c.is_subscribed,
             entity_types: c.allowed_entity_types.clone(),
+            supported_event_availabilities: c.supported_event_availabilities.clone(),
         }
     }
 }
@@ -479,6 +754,16 @@ pub struct AlarmParam {
     pub longitude: Option<f64>,
     /// Geofence radius in meters (default: 100)
     pub radius: Option<f64>,
+    /// Email address — if set, EventKit treats this as an email-type alarm
+    /// (server-side notification for CalDAV calendars).
+    pub email_address: Option<String>,
+    /// Custom audio cue name — if set, EventKit treats this as an audio-type
+    /// alarm. Macos sound names: "Glass", "Ping", "Pop", etc.
+    pub sound_name: Option<String>,
+    /// URL opened when the alarm fires — if set, EventKit treats this as a
+    /// procedure-type alarm. Apple deprecated this property in macOS 10.9
+    /// but it still functions. Strictly RFC 3986 validated.
+    pub url: Option<String>,
 }
 
 /// Recurrence configuration for inline use in create/update.
@@ -493,8 +778,18 @@ pub struct RecurrenceParam {
     /// Days of the week (1=Sun, 2=Mon, ..., 7=Sat) for weekly/monthly rules
     #[schemars(with = "Option<Vec<i32>>")]
     pub days_of_week: Option<Vec<u8>>,
-    /// Days of the month (1-31) for monthly rules
+    /// Days of the month (1..=31, or negatives counting from the end) for monthly rules
     pub days_of_month: Option<Vec<i32>>,
+    /// Months of the year (1..=12) for yearly rules. e.g. `[3]` = every March
+    pub months_of_year: Option<Vec<i32>>,
+    /// Weeks of the year (1..=53, or negatives counting from the end) for yearly rules
+    pub weeks_of_year: Option<Vec<i32>>,
+    /// Days of the year (1..=366, or negatives counting from the end) for yearly rules
+    pub days_of_year: Option<Vec<i32>>,
+    /// Set positions — filter applied after other fields. e.g. with
+    /// `frequency=monthly, days_of_week=[2], set_positions=[1]` = "first Monday
+    /// of every month". Negative values count from the end.
+    pub set_positions: Option<Vec<i32>>,
     /// End after this many occurrences (mutually exclusive with end_date)
     #[schemars(with = "Option<i64>")]
     pub end_after_count: Option<usize>,
@@ -508,14 +803,29 @@ pub struct RecurrenceParam {
 
 #[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
 pub struct ListRemindersRequest {
-    /// If true, show all reminders including completed ones. Default: false
+    /// If true, show all reminders including completed ones. Default: false.
+    /// Ignored when any `completed_*` filter is supplied (those imply
+    /// completed-only).
     #[serde(default)]
     pub show_completed: bool,
     /// Optional: Filter to a specific reminder list by name
     pub list_name: Option<String>,
+    /// Only return *incomplete* reminders whose due date is at or after this
+    /// timestamp. Format: 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM'.
+    pub due_after: Option<String>,
+    /// Only return *incomplete* reminders whose due date is before this
+    /// timestamp. Pair with `due_after` for a window.
+    pub due_before: Option<String>,
+    /// Only return *completed* reminders whose completion date is at or after
+    /// this timestamp. Presence of this field implies completed-only mode.
+    pub completed_after: Option<String>,
+    /// Only return *completed* reminders whose completion date is before
+    /// this timestamp. Presence of this field implies completed-only mode.
+    pub completed_before: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[allow(non_snake_case)]
 pub struct CreateReminderRequest {
     /// The title/name of the reminder
     pub title: String,
@@ -529,17 +839,25 @@ pub struct CreateReminderRequest {
     pub due_date: Option<String>,
     /// Optional start date when to begin working (format: 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM')
     pub start_date: Option<String>,
-    /// Optional URL to associate with the reminder
-    pub url: Option<String>,
+    /// Optional IANA timezone applied specifically to the due date
+    /// (e.g. "America/Los_Angeles"). Lets the reminder fire at the same
+    /// wall-clock time regardless of the device's current zone.
+    pub due_date_timezone: Option<String>,
+    /// Optional geofence — attaches a location-based alarm with the given
+    /// title/lat/lng/radius/proximity. Triggers a Location permission
+    /// prompt the first time it's used. This is the only location path
+    /// iCloud Reminders honors; the plain `location` and rich-link
+    /// `structuredLocation` properties on `EKReminder` are silently
+    /// dropped by the iCloud daemon and so aren't exposed here.
+    pub geofence: Option<GeofenceInput>,
     /// Optional alarms (replaces all existing). Each alarm can be time-based or location-based.
     pub alarms: Option<Vec<AlarmParam>>,
     /// Optional recurrence rule (replaces existing)
     pub recurrence: Option<RecurrenceParam>,
-    /// Optional tags (stored as #tagname in notes). Replaces existing tags when provided.
-    pub tags: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[allow(non_snake_case)]
 pub struct UpdateReminderRequest {
     /// The unique identifier of the reminder to update
     pub reminder_id: String,
@@ -557,14 +875,20 @@ pub struct UpdateReminderRequest {
     pub due_date: Option<String>,
     /// New start date. Set to empty string to clear.
     pub start_date: Option<String>,
-    /// URL to associate (set to empty string to clear)
-    pub url: Option<String>,
+    /// IANA timezone applied specifically to the due date
+    /// (e.g. "America/Los_Angeles"). Set to empty string to clear.
+    pub due_date_timezone: Option<String>,
+    /// Explicit completion timestamp. Setting this implicitly marks the
+    /// reminder completed; setting it to `""` clears completion (and the
+    /// reminder becomes incomplete). Apple's `setCompletionDate:` is
+    /// the authoritative completion toggle, so this wins over `completed`
+    /// when both are provided. ISO format: 'YYYY-MM-DD' or
+    /// 'YYYY-MM-DDTHH:MM:SS±HH:MM'.
+    pub completion_date: Option<String>,
     /// Alarms (replaces all existing when provided). Pass empty array to clear.
     pub alarms: Option<Vec<AlarmParam>>,
     /// Recurrence rule (replaces existing when provided). Omit to keep, set frequency to "" to clear.
     pub recurrence: Option<RecurrenceParam>,
-    /// Tags (stored as #tagname in notes). Replaces existing tags when provided.
-    pub tags: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -674,6 +998,7 @@ fn default_days() -> i64 {
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[allow(non_snake_case)]
 pub struct CreateEventRequest {
     /// The title of the event
     pub title: String,
@@ -694,7 +1019,13 @@ pub struct CreateEventRequest {
     #[serde(default)]
     pub all_day: bool,
     /// Optional URL to associate with the event
-    pub url: Option<String>,
+    pub URL: Option<String>,
+    /// Optional availability: "busy" (default), "free", "tentative",
+    /// "unavailable". Controls how the event shows on the timeline.
+    pub availability: Option<String>,
+    /// Optional structured location (title + lat/lng + radius). Enables
+    /// travel-time, map preview, and "leave at" suggestions in Calendar.app.
+    pub structured_location: Option<StructuredLocationInput>,
     /// Optional alarms (replaces all existing). Time-based only for events.
     pub alarms: Option<Vec<AlarmParam>>,
     /// Optional recurrence rule
@@ -709,27 +1040,43 @@ fn default_duration() -> i64 {
 pub struct EventIdRequest {
     /// The unique identifier of the event
     pub event_id: String,
-    /// If true, affect this event and all future occurrences (for recurring events)
+    /// Edit scope for recurring events: "this" (default) or "future".
+    /// Mirrors `EKSpan::ThisEvent` / `EKSpan::FutureEvents`.
+    pub span: Option<String>,
+    /// Deprecated alias for `span`. If true, equivalent to `span: "future"`.
+    /// New callers should use `span`; kept for back-compat.
     #[serde(default)]
     pub affect_future: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[allow(non_snake_case)]
 pub struct UpdateEventRequest {
     /// The unique identifier of the event to update
     pub event_id: String,
     /// New title for the event
     pub title: Option<String>,
-    /// New notes for the event
+    /// New notes for the event (empty string clears)
     pub notes: Option<String>,
-    /// New location for the event
+    /// New location for the event (empty string clears)
     pub location: Option<String>,
     /// New start date/time in format 'YYYY-MM-DD HH:MM'
     pub start: Option<String>,
     /// New end date/time in format 'YYYY-MM-DD HH:MM'
     pub end: Option<String>,
-    /// URL to associate (set to empty string to clear)
-    pub url: Option<String>,
+    /// Toggle all-day flag.
+    pub all_day: Option<bool>,
+    /// Move to another calendar by name.
+    pub calendar_name: Option<String>,
+    /// URL to associate (empty string clears)
+    pub URL: Option<String>,
+    /// New availability: "busy" | "free" | "tentative" | "unavailable".
+    pub availability: Option<String>,
+    /// New structured location; pass `null` to clear.
+    pub structured_location: Option<StructuredLocationInput>,
+    /// Edit scope for recurring events: "this" (default — only this
+    /// occurrence) or "future" (this and every later occurrence).
+    pub span: Option<String>,
     /// Alarms (replaces all existing when provided). Pass empty array to clear.
     pub alarms: Option<Vec<AlarmParam>>,
     /// Recurrence rule (replaces existing when provided)
@@ -847,13 +1194,16 @@ pub struct CreateReminderPromptArgs {
 // EventKit MCP Server
 // ============================================================================
 
-/// EventKit MCP Server - provides access to macOS Calendar and Reminders
-/// Note: EventKit managers are created fresh in each tool call as they are not Send+Sync
-#[derive(Clone)]
-pub struct EventKitServer {
-    /// Limits concurrent EventKit access to 1 at a time, since EventKit is !Send+!Sync
-    concurrency: std::sync::Arc<tokio::sync::Semaphore>,
-}
+/// EventKit MCP Server - provides access to macOS Calendar and Reminders.
+///
+/// EventKit objects (`Retained<EKEventStore>` and its managers) are `!Send + !Sync`,
+/// but every handler in this module keeps those values stack-local and never holds
+/// one across an `.await`. That makes the generated handler futures `Send`, so the
+/// server can run on a normal multi-thread tokio runtime without rmcp's `local`
+/// feature. New handlers MUST preserve this invariant — if you need async work,
+/// wrap the synchronous EventKit calls in `tokio::task::spawn_blocking` so the
+/// `!Send` value lives entirely inside the blocking closure.
+pub struct EventKitServer {}
 
 impl Default for EventKitServer {
     fn default() -> Self {
@@ -886,10 +1236,53 @@ fn parse_datetime(s: &str) -> Result<DateTime<Local>, String> {
 }
 
 #[tool_router]
+#[allow(non_snake_case)]
 impl EventKitServer {
     pub fn new() -> Self {
-        Self {
-            concurrency: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+        Self {}
+    }
+
+    // ========================================================================
+    // Authorization
+    // ========================================================================
+
+    #[tool(
+        description = "Check macOS permission status for Reminders and Calendar without requesting access. Use this to diagnose authorization problems before calling other tools — it never triggers a consent dialog."
+    )]
+    async fn auth_status(&self) -> Result<Json<AuthStatusOutput>, McpError> {
+        let reminders = RemindersManager::authorization_status();
+        let events = EventsManager::authorization_status();
+        Ok(Json(AuthStatusOutput {
+            reminders: auth_status_str(reminders),
+            events: auth_status_str(events),
+            remediation: auth_remediation(reminders, events),
+        }))
+    }
+
+    #[tool(
+        description = "Trigger the macOS consent dialog for Reminders or Calendar access. The first call shows the system prompt; subsequent calls return the cached status. Blocks until the user responds. Use `entity` = \"reminder\" or \"event\"."
+    )]
+    async fn request_access(
+        &self,
+        Parameters(params): Parameters<RequestAccessRequest>,
+    ) -> Result<Json<RequestAccessOutput>, McpError> {
+        match params.entity {
+            AccessEntity::Reminder => {
+                let manager = RemindersManager::new();
+                let granted = manager.request_access().map_err(|e| mcp_err(&e))?;
+                Ok(Json(RequestAccessOutput {
+                    granted,
+                    status: auth_status_str(RemindersManager::authorization_status()),
+                }))
+            }
+            AccessEntity::Event => {
+                let manager = EventsManager::new();
+                let granted = manager.request_access().map_err(|e| mcp_err(&e))?;
+                Ok(Json(RequestAccessOutput {
+                    granted,
+                    status: auth_status_str(EventsManager::authorization_status()),
+                }))
+            }
         }
     }
 
@@ -899,7 +1292,6 @@ impl EventKitServer {
 
     #[tool(description = "List all reminder lists (calendars) available in macOS Reminders.")]
     async fn list_reminder_lists(&self) -> Result<Json<ListResponse<CalendarOutput>>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
         match manager.list_calendars() {
             Ok(lists) => {
@@ -914,32 +1306,58 @@ impl EventKitServer {
     }
 
     #[tool(
-        description = "List reminders from macOS Reminders app. Can filter by completion status."
+        description = "List reminders from macOS Reminders app. Filters: `show_completed` toggles inclusion of completed items; `list_name` restricts to one list; `due_after`/`due_before` window incomplete reminders by their due date; `completed_after`/`completed_before` window completed reminders by their completion date. When any `completed_*` filter is supplied, results are completed-only regardless of `show_completed`."
     )]
     async fn list_reminders(
         &self,
         Parameters(params): Parameters<ListRemindersRequest>,
     ) -> Result<Json<ListResponse<ReminderOutput>>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
 
-        let reminders = if params.show_completed {
-            manager.fetch_all_reminders()
+        fn parse_opt_date(
+            label: &str,
+            s: &Option<String>,
+        ) -> Result<Option<DateTime<Local>>, McpError> {
+            s.as_deref()
+                .map(parse_datetime_or_time)
+                .transpose()
+                .map_err(|e| mcp_invalid(format!("Error parsing {label}: {e}")))
+        }
+        let due_after = parse_opt_date("due_after", &params.due_after)?;
+        let due_before = parse_opt_date("due_before", &params.due_before)?;
+        let completed_after = parse_opt_date("completed_after", &params.completed_after)?;
+        let completed_before = parse_opt_date("completed_before", &params.completed_before)?;
+
+        // Resolve list_name into the slice the manager expects.
+        let list_name_owned = params.list_name.clone();
+        let calendar_titles: Option<Vec<&str>> = list_name_owned.as_ref().map(|n| vec![n.as_str()]);
+        let calendar_titles_ref: Option<&[&str]> = calendar_titles.as_deref();
+
+        let reminders = if completed_after.is_some() || completed_before.is_some() {
+            manager.fetch_completed_reminders_in_range(
+                completed_after,
+                completed_before,
+                calendar_titles_ref,
+            )
+        } else if due_after.is_some() || due_before.is_some() {
+            manager.fetch_incomplete_reminders_in_due_range(
+                due_after,
+                due_before,
+                calendar_titles_ref,
+            )
+        } else if params.show_completed {
+            // Fall back to all-reminders + post-filter for backward compat —
+            // EventKit has no "all reminders in calendars" predicate that
+            // also includes completed by default; fetch_all delegates to
+            // fetch_reminders(None) which uses predicateForRemindersInCalendars.
+            manager.fetch_reminders(calendar_titles_ref)
         } else {
-            manager.fetch_incomplete_reminders()
+            manager.fetch_incomplete_reminders_in_due_range(None, None, calendar_titles_ref)
         };
 
         match reminders {
             Ok(items) => {
-                let filtered: Vec<_> = if let Some(name) = params.list_name {
-                    items
-                        .into_iter()
-                        .filter(|r| r.calendar_title.as_deref() == Some(&name))
-                        .collect()
-                } else {
-                    items
-                };
-                let items: Vec<_> = filtered
+                let items: Vec<_> = items
                     .iter()
                     .map(ReminderOutput::from_item_summary)
                     .collect();
@@ -953,13 +1371,12 @@ impl EventKitServer {
     }
 
     #[tool(
-        description = "Create a new reminder in macOS Reminders. You MUST specify which list to add it to. Use list_reminder_lists first to see available lists. Can include alarms, recurrence, and URL inline."
+        description = "Create a new reminder in macOS Reminders. You MUST specify which list to add it to (use list_reminder_lists first to see available lists). Inline configuration: alarms (time-based or proximity-based via `geofence`), recurrence, due/start dates, IANA timezone for the due date. NB: `URL`, free-text `location`, and `structured_location` are intentionally absent on the reminder surface — iCloud Reminders silently drops those mutations. Use `set_reminder_geofence` for location-based reminders (the iCloud-honored path); for events those fields are first-class via `create_event`. Tags (the Reminders.app Tag Sidebar) are an iCloud server-side feature not reachable through EventKit at all."
     )]
     async fn create_reminder(
         &self,
         Parameters(params): Parameters<CreateReminderRequest>,
     ) -> Result<Json<ReminderOutput>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
 
         // Validate the list exists
@@ -997,28 +1414,35 @@ impl EventKitServer {
 
         let priority = params.priority.as_ref().map(Priority::to_usize);
 
-        // Merge tags into notes if provided
-        let notes = if let Some(tags) = &params.tags {
-            Some(apply_tags(params.notes.as_deref(), tags))
-        } else {
-            params.notes.clone()
-        };
-
-        match manager.create_reminder(
-            &params.title,
-            notes.as_deref(),
-            Some(&calendar_title),
+        match manager.create_reminder(&crate::ReminderDraft {
+            title: &params.title,
+            notes: params.notes.as_deref(),
+            calendar_title: Some(&calendar_title),
             priority,
             due_date,
             start_date,
-        ) {
+            due_date_timezone: params.due_date_timezone.as_deref(),
+            ..Default::default()
+        }) {
             Ok(reminder) => {
                 let id = reminder.identifier.clone();
-                if let Some(url) = &params.url {
-                    let _ = manager.set_url(&id, Some(url));
-                }
                 if let Some(alarms) = &params.alarms {
                     apply_alarms_reminder(&manager, &id, alarms);
+                }
+                if let Some(g) = &params.geofence {
+                    let proximity = match g.proximity {
+                        GeofenceProximity::Enter => crate::AlarmProximity::Enter,
+                        GeofenceProximity::Leave => crate::AlarmProximity::Leave,
+                    };
+                    let sl = crate::StructuredLocation {
+                        title: g.title.clone(),
+                        latitude: g.latitude,
+                        longitude: g.longitude,
+                        radius: g.radius_meters,
+                    };
+                    if let Err(e) = manager.set_geofence(&id, Some((&sl, proximity))) {
+                        return Err(mcp_err(&e));
+                    }
                 }
                 if let Some(recurrence) = &params.recurrence
                     && let Ok(rule) = parse_recurrence_param(recurrence)
@@ -1033,13 +1457,12 @@ impl EventKitServer {
     }
 
     #[tool(
-        description = "Update an existing reminder. All fields are optional. Can update alarms, recurrence, and URL inline."
+        description = "Update an existing reminder. All fields are optional; only the ones you supply are written. Inline edits: title, notes, completed, priority, due/start date (empty string clears), due-date IANA timezone (empty string clears), completion_date (empty string clears and marks incomplete), alarms (replaces all when supplied), recurrence, list move. NB: `URL`/`location`/`structured_location` are absent — see `create_reminder`."
     )]
     async fn update_reminder(
         &self,
         Parameters(params): Parameters<UpdateReminderRequest>,
     ) -> Result<Json<ReminderOutput>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
 
         // Parse due date: Some("") means clear, Some(date) means set, None means no change
@@ -1079,39 +1502,41 @@ impl EventKitServer {
 
         let priority = params.priority.as_ref().map(Priority::to_usize);
 
-        // Merge tags into notes if provided
-        let notes = if let Some(tags) = &params.tags {
-            // For update, we need the existing notes to merge with
-            let existing_notes = manager
-                .get_reminder(&params.reminder_id)
-                .ok()
-                .and_then(|r| r.notes);
-            let base = params.notes.as_deref().or(existing_notes.as_deref());
-            Some(apply_tags(base, tags))
-        } else {
-            params.notes.clone()
+        // Map each Option<String> ("" means clear, otherwise set) to the
+        // Option<Option<&str>> patch encoding (Some(None) = clear).
+        fn opt_patch(s: &Option<String>) -> Option<Option<&str>> {
+            s.as_ref()
+                .map(|v| if v.is_empty() { None } else { Some(v.as_str()) })
+        }
+        let tz_patch = opt_patch(&params.due_date_timezone);
+
+        // completion_date: same "" = clear, set = set, omitted = no change.
+        let completion_date_patch: Option<Option<DateTime<Local>>> = match &params.completion_date {
+            None => None,
+            Some(s) if s.is_empty() => Some(None),
+            Some(s) => match parse_datetime(s) {
+                Ok(dt) => Some(Some(dt)),
+                Err(e) => return Err(mcp_invalid(format!("Error parsing completion_date: {e}"))),
+            },
         };
 
         match manager.update_reminder(
             &params.reminder_id,
-            params.title.as_deref(),
-            notes.as_deref(),
-            params.completed,
-            priority,
-            due_date,
-            start_date,
-            params.list_name.as_deref(),
+            &crate::ReminderPatch {
+                title: params.title.as_deref(),
+                notes: params.notes.as_deref(),
+                completed: params.completed,
+                priority,
+                due_date,
+                start_date,
+                calendar_title: params.list_name.as_deref(),
+                due_date_timezone: tz_patch,
+                completion_date: completion_date_patch,
+                ..Default::default()
+            },
         ) {
             Ok(reminder) => {
                 let id = reminder.identifier.clone();
-                if let Some(url) = &params.url {
-                    let url_val = if url.is_empty() {
-                        None
-                    } else {
-                        Some(url.as_str())
-                    };
-                    let _ = manager.set_url(&id, url_val);
-                }
                 if let Some(alarms) = &params.alarms {
                     apply_alarms_reminder(&manager, &id, alarms);
                 }
@@ -1134,7 +1559,6 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<CreateReminderListRequest>,
     ) -> Result<Json<CalendarOutput>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
         match manager.create_calendar(&params.name) {
             Ok(cal) => Ok(Json(CalendarOutput::from_info(&cal))),
@@ -1147,7 +1571,6 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<UpdateReminderListRequest>,
     ) -> Result<Json<CalendarOutput>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
         let color_rgba = params.color.as_ref().map(CalendarColor::to_rgba);
         match manager.update_calendar(&params.list_id, params.name.as_deref(), color_rgba) {
@@ -1163,7 +1586,6 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<DeleteReminderListRequest>,
     ) -> Result<Json<DeletedResponse>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
         match manager.delete_calendar(&params.list_id) {
             Ok(_) => Ok(Json(DeletedResponse { id: params.list_id })),
@@ -1176,7 +1598,6 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<ReminderIdRequest>,
     ) -> Result<Json<ReminderOutput>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
         match manager.complete_reminder(&params.reminder_id) {
             Ok(_) => {
@@ -1195,7 +1616,6 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<ReminderIdRequest>,
     ) -> Result<Json<ReminderOutput>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
         match manager.uncomplete_reminder(&params.reminder_id) {
             Ok(_) => {
@@ -1214,7 +1634,6 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<ReminderIdRequest>,
     ) -> Result<Json<ReminderOutput>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
         match manager.get_reminder(&params.reminder_id) {
             Ok(r) => Ok(Json(ReminderOutput::from_item(&r, &manager))),
@@ -1227,7 +1646,6 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<ReminderIdRequest>,
     ) -> Result<Json<DeletedResponse>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
         match manager.delete_reminder(&params.reminder_id) {
             Ok(_) => Ok(Json(DeletedResponse {
@@ -1237,13 +1655,77 @@ impl EventKitServer {
         }
     }
 
+    // ------------------------------------------------------------------------
+    // Reminder posture setters (one field at a time, for fix-ups)
+    //
+    // NB: URL, plain location, and rich structuredLocation setters are
+    // intentionally not exposed for reminders — iCloud silently drops those
+    // mutations even though the EventKit APIs accept them. The geofence path
+    // (location-based alarm) is the only iCloud-honored location write.
+    // For events those same fields are first-class — see create_event /
+    // update_event.
+    // ------------------------------------------------------------------------
+
+    #[tool(
+        description = "Set or clear the timezone applied specifically to the reminder's due date (separate from the item-level timezone). Use an IANA zone like \"America/Los_Angeles\". Pass `timezone: null` or `\"\"` to clear."
+    )]
+    async fn set_reminder_due_timezone(
+        &self,
+        Parameters(params): Parameters<SetReminderDueTimezoneRequest>,
+    ) -> Result<Json<ReminderOutput>, McpError> {
+        let manager = RemindersManager::new();
+        let tz = params
+            .timezone
+            .as_deref()
+            .and_then(|t| if t.is_empty() { None } else { Some(t) });
+        manager
+            .set_due_date_timezone(&params.reminder_id, tz)
+            .map_err(|e| mcp_err(&e))?;
+        let item = manager
+            .get_reminder(&params.reminder_id)
+            .map_err(|e| mcp_err(&e))?;
+        Ok(Json(ReminderOutput::from_item(&item, &manager)))
+    }
+
+    #[tool(
+        description = "Attach (or clear) a geofence on a reminder. Implemented as a location-based alarm — \"remind me when I arrive at/leave this place\". Triggers a Location permission prompt the first time. Omit `geofence` to clear any existing geofence."
+    )]
+    async fn set_reminder_geofence(
+        &self,
+        Parameters(params): Parameters<SetReminderGeofenceRequest>,
+    ) -> Result<Json<ReminderOutput>, McpError> {
+        let manager = RemindersManager::new();
+        let owned = params.geofence.as_ref().map(|g| {
+            let proximity = match g.proximity {
+                GeofenceProximity::Enter => crate::AlarmProximity::Enter,
+                GeofenceProximity::Leave => crate::AlarmProximity::Leave,
+            };
+            (
+                crate::StructuredLocation {
+                    title: g.title.clone(),
+                    latitude: g.latitude,
+                    longitude: g.longitude,
+                    radius: g.radius_meters,
+                },
+                proximity,
+            )
+        });
+        let geofence_ref = owned.as_ref().map(|(s, p)| (s, *p));
+        manager
+            .set_geofence(&params.reminder_id, geofence_ref)
+            .map_err(|e| mcp_err(&e))?;
+        let item = manager
+            .get_reminder(&params.reminder_id)
+            .map_err(|e| mcp_err(&e))?;
+        Ok(Json(ReminderOutput::from_item(&item, &manager)))
+    }
+
     // ========================================================================
     // Calendar/Events Tools
     // ========================================================================
 
     #[tool(description = "List all calendars available in macOS Calendar app.")]
     async fn list_calendars(&self) -> Result<Json<ListResponse<CalendarOutput>>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = EventsManager::new();
         match manager.list_calendars() {
             Ok(cals) => {
@@ -1258,13 +1740,41 @@ impl EventKitServer {
     }
 
     #[tool(
+        description = "Return the calendar that will be used by `create_event` when no `calendar_name` is supplied. Mirrors `EKEventStore.defaultCalendarForNewEvents`."
+    )]
+    async fn get_default_event_calendar(&self) -> Result<Json<CalendarOutput>, McpError> {
+        let manager = EventsManager::new();
+        match manager.default_calendar() {
+            Ok(cal) => Ok(Json(CalendarOutput::from_info(&cal))),
+            Err(e) => Err(mcp_err(&e)),
+        }
+    }
+
+    #[tool(
+        description = "Set an event's availability — controls how the event shows on the timeline. Use \"busy\" (default), \"free\", \"tentative\", or \"unavailable\". Always applies to just this occurrence (per-instance attribute)."
+    )]
+    async fn set_event_availability(
+        &self,
+        Parameters(params): Parameters<SetEventAvailabilityRequest>,
+    ) -> Result<Json<EventOutput>, McpError> {
+        let manager = EventsManager::new();
+        let availability = parse_availability(&params.availability).map_err(mcp_invalid)?;
+        manager
+            .set_event_availability(&params.event_id, availability)
+            .map_err(|e| mcp_err(&e))?;
+        let item = manager
+            .get_event(&params.event_id)
+            .map_err(|e| mcp_err(&e))?;
+        Ok(Json(EventOutput::from_item(&item, &manager)))
+    }
+
+    #[tool(
         description = "List calendar events. By default shows today's events. Can specify a date range."
     )]
     async fn list_events(
         &self,
         Parameters(params): Parameters<ListEventsRequest>,
     ) -> Result<Json<ListResponse<EventOutput>>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = EventsManager::new();
 
         let events = if params.days == 1 {
@@ -1299,13 +1809,12 @@ impl EventKitServer {
     }
 
     #[tool(
-        description = "Create a new calendar event in macOS Calendar. Can include alarms, recurrence, and URL inline."
+        description = "Create a new calendar event in macOS Calendar. Inline configuration: title, start/end (or duration), location, calendar, all-day flag, URL, alarms (time-based; events don't support proximity alarms), recurrence."
     )]
     async fn create_event(
         &self,
         Parameters(params): Parameters<CreateEventRequest>,
     ) -> Result<Json<EventOutput>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = EventsManager::new();
 
         let start = match parse_datetime(&params.start) {
@@ -1322,32 +1831,37 @@ impl EventKitServer {
             start + Duration::minutes(params.duration_minutes)
         };
 
-        let calendar_id = if let Some(cal_name) = &params.calendar_name {
-            match manager.list_calendars() {
-                Ok(calendars) => calendars
-                    .iter()
-                    .find(|c| &c.title == cal_name)
-                    .map(|c| c.identifier.clone()),
-                Err(_) => None,
-            }
-        } else {
-            None
-        };
+        let availability = params
+            .availability
+            .as_deref()
+            .map(parse_availability)
+            .transpose()
+            .map_err(mcp_invalid)?;
 
-        match manager.create_event(
-            &params.title,
-            start,
-            end,
-            params.notes.as_deref(),
-            params.location.as_deref(),
-            calendar_id.as_deref(),
-            params.all_day,
-        ) {
+        let sl_owned = params
+            .structured_location
+            .as_ref()
+            .map(|s| crate::StructuredLocation {
+                title: s.title.clone(),
+                latitude: s.latitude,
+                longitude: s.longitude,
+                radius: s.radius_meters,
+            });
+
+        match manager.create_event(&crate::EventDraft {
+            title: &params.title,
+            start: Some(start),
+            end: Some(end),
+            notes: params.notes.as_deref(),
+            location: params.location.as_deref(),
+            calendar_title: params.calendar_name.as_deref(),
+            all_day: params.all_day,
+            URL: params.URL.as_deref(),
+            availability,
+            structured_location: sl_owned.as_ref(),
+        }) {
             Ok(event) => {
                 let id = event.identifier.clone();
-                if let Some(url) = &params.url {
-                    let _ = manager.set_event_url(&id, Some(url));
-                }
                 if let Some(alarms) = &params.alarms {
                     apply_alarms_event(&manager, &id, alarms);
                 }
@@ -1363,14 +1877,17 @@ impl EventKitServer {
         }
     }
 
-    #[tool(description = "Delete a calendar event from macOS Calendar.")]
+    #[tool(
+        description = "Delete a calendar event. `span: \"this\" | \"future\"` controls recurring-event scope (default: \"this\"). The legacy boolean `affect_future` is still accepted as an alias for `span: \"future\"`."
+    )]
     async fn delete_event(
         &self,
         Parameters(params): Parameters<EventIdRequest>,
     ) -> Result<Json<DeletedResponse>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = EventsManager::new();
-        match manager.delete_event(&params.event_id, params.affect_future) {
+        let span = parse_span(params.span.as_deref()).map_err(mcp_invalid)?;
+        let affect_future = matches!(span, crate::EventSpan::Future) || params.affect_future;
+        match manager.delete_event(&params.event_id, affect_future) {
             Ok(_) => Ok(Json(DeletedResponse {
                 id: params.event_id,
             })),
@@ -1383,7 +1900,6 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<EventIdRequest>,
     ) -> Result<Json<EventOutput>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = EventsManager::new();
         match manager.get_event(&params.event_id) {
             Ok(e) => Ok(Json(EventOutput::from_item(&e, &manager))),
@@ -1400,7 +1916,6 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<CreateReminderListRequest>,
     ) -> Result<Json<CalendarOutput>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = EventsManager::new();
         match manager.create_event_calendar(&params.name) {
             Ok(cal) => Ok(Json(CalendarOutput::from_info(&cal))),
@@ -1413,7 +1928,6 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<UpdateEventCalendarRequest>,
     ) -> Result<Json<CalendarOutput>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = EventsManager::new();
 
         let color_rgba = params.color.as_ref().map(CalendarColor::to_rgba);
@@ -1432,7 +1946,6 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<DeleteReminderListRequest>,
     ) -> Result<Json<DeletedResponse>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = EventsManager::new();
         match manager.delete_event_calendar(&params.list_id) {
             Ok(()) => Ok(Json(DeletedResponse { id: params.list_id })),
@@ -1446,7 +1959,6 @@ impl EventKitServer {
 
     #[tool(description = "List all available sources (accounts like iCloud, Local, Exchange).")]
     async fn list_sources(&self) -> Result<Json<ListResponse<SourceOutput>>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
         match manager.list_sources() {
             Ok(sources) => {
@@ -1465,13 +1977,12 @@ impl EventKitServer {
     // ========================================================================
 
     #[tool(
-        description = "Update an existing calendar event. All fields are optional. Can update alarms, recurrence, and URL inline."
+        description = "Update an existing calendar event. All fields are optional; only those you supply are written. Inline edits: title, notes (empty clears), location (empty clears), start/end, all_day toggle, calendar move (`calendar_name`), URL (empty clears), availability, structured_location (null clears), alarms (replaces all), recurrence (empty frequency clears). `span: \"this\" | \"future\"` controls recurring-event edit scope; defaults to \"this\"."
     )]
     async fn update_event(
         &self,
         Parameters(params): Parameters<UpdateEventRequest>,
     ) -> Result<Json<EventOutput>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = EventsManager::new();
 
         let start = match params.start.as_ref().map(|s| parse_datetime(s)).transpose() {
@@ -1483,24 +1994,57 @@ impl EventKitServer {
             Err(e) => return Err(mcp_invalid(format!("Error: {e}"))),
         };
 
+        // Empty-string-clears convention, same as reminders side.
+        fn opt_patch(s: &Option<String>) -> Option<Option<&str>> {
+            s.as_ref()
+                .map(|v| if v.is_empty() { None } else { Some(v.as_str()) })
+        }
+        let notes_patch = opt_patch(&params.notes);
+        let location_patch = opt_patch(&params.location);
+        let url_patch = opt_patch(&params.URL);
+
+        let availability = params
+            .availability
+            .as_deref()
+            .map(parse_availability)
+            .transpose()
+            .map_err(mcp_invalid)?;
+
+        let sl_owned = params
+            .structured_location
+            .as_ref()
+            .map(|s| crate::StructuredLocation {
+                title: s.title.clone(),
+                latitude: s.latitude,
+                longitude: s.longitude,
+                radius: s.radius_meters,
+            });
+        // We only get Some(value) here — no clear path through serde because
+        // null collapses into None for Option<T>. For an explicit clear,
+        // callers can call update_event again with a future schema enhancement
+        // (low-frequency need; matches reminder side).
+        let sl_patch = sl_owned.as_ref().map(Some);
+
+        let span = parse_span(params.span.as_deref()).map_err(mcp_invalid)?;
+
         match manager.update_event(
             &params.event_id,
-            params.title.as_deref(),
-            params.notes.as_deref(),
-            params.location.as_deref(),
-            start,
-            end,
+            &crate::EventPatch {
+                title: params.title.as_deref(),
+                notes: notes_patch,
+                location: location_patch,
+                start,
+                end,
+                all_day: params.all_day,
+                calendar_title: params.calendar_name.as_deref(),
+                URL: url_patch,
+                availability,
+                structured_location: sl_patch,
+                span,
+            },
         ) {
             Ok(event) => {
                 let id = event.identifier.clone();
-                if let Some(url) = &params.url {
-                    let url_val = if url.is_empty() {
-                        None
-                    } else {
-                        Some(url.as_str())
-                    };
-                    let _ = manager.set_event_url(&id, url_val);
-                }
                 if let Some(alarms) = &params.alarms {
                     apply_alarms_event(&manager, &id, alarms);
                 }
@@ -1523,7 +2067,6 @@ impl EventKitServer {
         description = "Get the user's current location (latitude, longitude). Requires location permission."
     )]
     async fn get_current_location(&self) -> Result<Json<CoordinateOutput>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = crate::location::LocationManager::new();
         match manager.get_current_location(std::time::Duration::from_secs(10)) {
             Ok(coord) => Ok(Json(CoordinateOutput {
@@ -1544,7 +2087,6 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<SearchRequest>,
     ) -> Result<Json<SearchResponse>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let query = params.query.to_lowercase();
 
         let search_reminders = matches!(params.item_type, None | Some(ItemType::Reminder));
@@ -1617,7 +2159,6 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<BatchDeleteRequest>,
     ) -> Result<Json<BatchResponse>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let mut succeeded = 0usize;
         let mut errors = Vec::new();
 
@@ -1665,7 +2206,6 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<BatchMoveRequest>,
     ) -> Result<Json<BatchResponse>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
         let mut succeeded = 0usize;
         let mut errors = Vec::new();
@@ -1673,13 +2213,10 @@ impl EventKitServer {
         for id in &params.reminder_ids {
             match manager.update_reminder(
                 id,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(&params.destination_list_name),
+                &crate::ReminderPatch {
+                    calendar_title: Some(&params.destination_list_name),
+                    ..Default::default()
+                },
             ) {
                 Ok(_) => succeeded += 1,
                 Err(e) => errors.push(format!("{id}: {e}")),
@@ -1709,7 +2246,6 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<BatchUpdateRequest>,
     ) -> Result<Json<BatchResponse>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let mut succeeded = 0usize;
         let mut errors = Vec::new();
 
@@ -1731,13 +2267,14 @@ impl EventKitServer {
                     };
                     match manager.update_reminder(
                         &item.item_id,
-                        item.title.as_deref(),
-                        item.notes.as_deref(),
-                        item.completed,
-                        priority,
-                        due_date,
-                        None,
-                        None,
+                        &crate::ReminderPatch {
+                            title: item.title.as_deref(),
+                            notes: item.notes.as_deref(),
+                            completed: item.completed,
+                            priority,
+                            due_date,
+                            ..Default::default()
+                        },
                     ) {
                         Ok(_) => succeeded += 1,
                         Err(e) => errors.push(format!("{}: {e}", item.item_id)),
@@ -1749,11 +2286,14 @@ impl EventKitServer {
                 for item in &params.updates {
                     match manager.update_event(
                         &item.item_id,
-                        item.title.as_deref(),
-                        item.notes.as_deref(),
-                        None,
-                        None,
-                        None,
+                        &crate::EventPatch {
+                            title: item.title.as_deref(),
+                            notes: item
+                                .notes
+                                .as_ref()
+                                .map(|s| if s.is_empty() { None } else { Some(s.as_str()) }),
+                            ..Default::default()
+                        },
                     ) {
                         Ok(_) => succeeded += 1,
                         Err(e) => errors.push(format!("{}: {e}", item.item_id)),
@@ -1808,12 +2348,48 @@ fn parse_recurrence_param(
         crate::RecurrenceEndCondition::Never
     };
 
+    // Range validation at boundary. Apple raises opaque NSExceptions for
+    // out-of-range values, so we catch them here with friendlier messages.
+    fn check_range(
+        name: &str,
+        vals: &Option<Vec<i32>>,
+        valid: impl Fn(i32) -> bool,
+    ) -> Result<(), String> {
+        if let Some(vs) = vals {
+            for v in vs {
+                if !valid(*v) {
+                    return Err(format!("{name}: value {v} out of range"));
+                }
+            }
+        }
+        Ok(())
+    }
+    check_range("days_of_month", &params.days_of_month, |v| {
+        (-31..=31).contains(&v) && v != 0
+    })?;
+    check_range("months_of_year", &params.months_of_year, |v| {
+        (1..=12).contains(&v)
+    })?;
+    check_range("weeks_of_year", &params.weeks_of_year, |v| {
+        (-53..=53).contains(&v) && v != 0
+    })?;
+    check_range("days_of_year", &params.days_of_year, |v| {
+        (-366..=366).contains(&v) && v != 0
+    })?;
+    check_range("set_positions", &params.set_positions, |v| {
+        (-366..=366).contains(&v) && v != 0
+    })?;
+
     Ok(crate::RecurrenceRule {
         frequency,
         interval: params.interval,
         end,
         days_of_week: params.days_of_week.clone(),
         days_of_month: params.days_of_month.clone(),
+        months_of_year: params.months_of_year.clone(),
+        weeks_of_year: params.weeks_of_year.clone(),
+        days_of_year: params.days_of_year.clone(),
+        set_positions: params.set_positions.clone(),
     })
 }
 
@@ -1887,54 +2463,13 @@ fn alarm_param_to_info(param: &AlarmParam) -> crate::AlarmInfo {
     };
     crate::AlarmInfo {
         relative_offset: param.relative_offset,
-        absolute_date: None,
         proximity,
         location,
+        email_address: param.email_address.clone(),
+        sound_name: param.sound_name.clone(),
+        url: param.url.clone(),
+        ..Default::default()
     }
-}
-
-/// Format alarms for display output.
-/// Extract #tags from notes content.
-fn extract_tags(notes: &str) -> Vec<String> {
-    notes
-        .split_whitespace()
-        .filter(|w| w.starts_with('#') && w.len() > 1)
-        .map(|w| w[1..].to_string())
-        .collect()
-}
-
-/// Merge tags into notes. Removes existing #tag tokens, appends new ones.
-fn apply_tags(notes: Option<&str>, tags: &[String]) -> String {
-    // Keep lines that aren't purely tags
-    let mut result: Vec<String> = notes
-        .unwrap_or("")
-        .lines()
-        .filter(|line| {
-            let trimmed = line.trim();
-            // Remove lines that are only #tags
-            !trimmed
-                .split_whitespace()
-                .all(|w| w.starts_with('#') && w.len() > 1)
-                || trimmed.is_empty()
-        })
-        .map(String::from)
-        .collect();
-    // Remove trailing empty lines
-    while result.last().is_some_and(std::string::String::is_empty) {
-        result.pop();
-    }
-    if !tags.is_empty() {
-        if !result.is_empty() {
-            result.push(String::new());
-        }
-        result.push(
-            tags.iter()
-                .map(|t| format!("#{t}"))
-                .collect::<Vec<_>>()
-                .join(" "),
-        );
-    }
-    result.join("\n")
 }
 
 // ============================================================================
@@ -1952,7 +2487,6 @@ impl EventKitServer {
         &self,
         Parameters(args): Parameters<ListRemindersPromptArgs>,
     ) -> Result<GetPromptResult, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
         let reminders = manager.fetch_incomplete_reminders().map_err(|e| {
             McpError::internal_error(format!("Failed to list reminders: {e}"), None)
@@ -2004,7 +2538,6 @@ impl EventKitServer {
         description = "List all reminder lists available in Reminders"
     )]
     async fn reminder_lists_prompt(&self) -> Result<GetPromptResult, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
         let lists = manager.list_calendars().map_err(|e| {
             McpError::internal_error(format!("Failed to list calendars: {e}"), None)
@@ -2037,7 +2570,6 @@ impl EventKitServer {
         &self,
         Parameters(args): Parameters<MoveReminderPromptArgs>,
     ) -> Result<GetPromptResult, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
 
         // Find the destination calendar
@@ -2055,13 +2587,10 @@ impl EventKitServer {
             Some(dest_list) => {
                 match manager.update_reminder(
                     &args.reminder_id,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(&dest_list.title),
+                    &crate::ReminderPatch {
+                        calendar_title: Some(&dest_list.title),
+                        ..Default::default()
+                    },
                 ) {
                     Ok(updated) => Ok(GetPromptResult::new(vec![PromptMessage::new_text(
                         PromptMessageRole::User,
@@ -2102,7 +2631,6 @@ impl EventKitServer {
         &self,
         Parameters(args): Parameters<CreateReminderPromptArgs>,
     ) -> Result<GetPromptResult, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
 
         let due = args
@@ -2112,14 +2640,14 @@ impl EventKitServer {
             .transpose()
             .map_err(|e| McpError::internal_error(format!("Invalid due date: {e}"), None))?;
 
-        match manager.create_reminder(
-            &args.title,
-            args.notes.as_deref(),
-            args.list_name.as_deref(),
-            args.priority.map(|p| p as usize),
-            due,
-            None,
-        ) {
+        match manager.create_reminder(&crate::ReminderDraft {
+            title: &args.title,
+            notes: args.notes.as_deref(),
+            calendar_title: args.list_name.as_deref(),
+            priority: args.priority.map(|p| p as usize),
+            due_date: due,
+            ..Default::default()
+        }) {
             Ok(reminder) => {
                 let mut details = format!("Created reminder: \"{}\"", reminder.title);
                 if let Some(notes) = &reminder.notes {
@@ -2203,12 +2731,31 @@ pub async fn run_mcp_server() -> anyhow::Result<()> {
 // Dump helpers — serialize objects to JSON for CLI debugging
 // ============================================================================
 
-/// Dump a single reminder as pretty JSON (with alarms, recurrence, tags).
+/// Dump a single reminder as pretty JSON (with alarms and recurrence rules).
 pub fn dump_reminder(id: &str) -> Result<String, crate::EventKitError> {
     let manager = RemindersManager::new();
     let r = manager.get_reminder(id)?;
     let output = ReminderOutput::from_item(&r, &manager);
     Ok(serde_json::to_string_pretty(&output).unwrap())
+}
+
+/// Dump every Objective-C `@property` on the reminder, its calendar, and that
+/// calendar's source — using runtime reflection. Use this to discover native
+/// fields not yet surfaced by [`crate::ReminderItem`].
+///
+/// `read_values` controls whether property values are read via KVC. Schema-
+/// only (`false`) is always safe; reading values may surface NSExceptions and
+/// — for a small denylisted set — could abort the process via C asserts.
+pub fn dump_reminder_raw(id: &str, read_values: bool) -> Result<String, crate::EventKitError> {
+    let manager = RemindersManager::new();
+    manager.dump_reminder_raw(id, read_values)
+}
+
+/// Probe a curated list of suspected-private selectors on a reminder
+/// (`richLink`, `tags`, `structuredData`, etc.). Read-only, exception-safe.
+pub fn dump_reminder_private(id: &str) -> Result<String, crate::EventKitError> {
+    let manager = RemindersManager::new();
+    manager.dump_reminder_private(id)
 }
 
 /// Dump all reminders as pretty JSON (summary mode — no alarm/recurrence fetch).
@@ -2268,4 +2815,177 @@ pub fn dump_sources() -> Result<String, crate::EventKitError> {
     let sources = manager.list_sources()?;
     let output: Vec<_> = sources.iter().map(SourceOutput::from_info).collect();
     Ok(serde_json::to_string_pretty(&output).unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::EventKitError;
+
+    #[test]
+    fn parse_availability_accepts_every_variant() {
+        for (s, expected) in [
+            ("busy", crate::EventAvailability::Busy),
+            ("free", crate::EventAvailability::Free),
+            ("tentative", crate::EventAvailability::Tentative),
+            ("unavailable", crate::EventAvailability::Unavailable),
+            ("not_supported", crate::EventAvailability::NotSupported),
+        ] {
+            assert_eq!(parse_availability(s).unwrap(), expected);
+        }
+        assert!(parse_availability("BUSY").is_err()); // case-sensitive
+        assert!(parse_availability("anything else").is_err());
+    }
+
+    #[test]
+    fn parse_span_defaults_to_this() {
+        assert_eq!(parse_span(None).unwrap(), crate::EventSpan::This);
+        assert_eq!(parse_span(Some("this")).unwrap(), crate::EventSpan::This);
+        assert_eq!(
+            parse_span(Some("future")).unwrap(),
+            crate::EventSpan::Future
+        );
+        assert!(parse_span(Some("bogus")).is_err());
+    }
+
+    #[test]
+    fn create_event_request_deserializes_new_fields() {
+        // Catches accidental rename of the new fields on the input schema.
+        let json = serde_json::json!({
+            "title": "Plan",
+            "start": "2026-06-01 14:00",
+            "all_day": false,
+            "availability": "tentative",
+            "structured_location": {
+                "title": "Office",
+                "latitude": 37.78,
+                "longitude": -122.42,
+                "radius_meters": 100.0
+            }
+        });
+        let req: CreateEventRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.availability.as_deref(), Some("tentative"));
+        assert_eq!(req.structured_location.unwrap().title, "Office");
+    }
+
+    #[test]
+    fn update_event_request_deserializes_span_and_new_fields() {
+        let json = serde_json::json!({
+            "event_id": "ABC",
+            "all_day": true,
+            "calendar_name": "Work",
+            "availability": "free",
+            "span": "future",
+        });
+        let req: UpdateEventRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.all_day, Some(true));
+        assert_eq!(req.calendar_name.as_deref(), Some("Work"));
+        assert_eq!(req.availability.as_deref(), Some("free"));
+        assert_eq!(req.span.as_deref(), Some("future"));
+    }
+
+    #[test]
+    fn auth_status_str_covers_every_variant() {
+        // Update this whenever AuthorizationStatus gains a variant — that's
+        // the whole point: a new variant breaks compilation here, and the
+        // MCP `auth_status` response stays in sync with the source enum.
+        for s in [
+            AuthorizationStatus::NotDetermined,
+            AuthorizationStatus::Restricted,
+            AuthorizationStatus::Denied,
+            AuthorizationStatus::FullAccess,
+            AuthorizationStatus::WriteOnly,
+        ] {
+            let str_form = auth_status_str(s);
+            assert!(!str_form.is_empty(), "empty string for {s:?}");
+            assert!(
+                !str_form.contains(' '),
+                "MCP wire format should be PascalCase, got {str_form:?} for {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn auth_remediation_absent_when_both_granted() {
+        for r in [
+            AuthorizationStatus::FullAccess,
+            AuthorizationStatus::WriteOnly,
+        ] {
+            for e in [
+                AuthorizationStatus::FullAccess,
+                AuthorizationStatus::WriteOnly,
+            ] {
+                assert!(
+                    auth_remediation(r, e).is_none(),
+                    "expected no remediation for ({r:?}, {e:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn auth_remediation_picks_worst_status() {
+        // Denied (3) > Restricted (2) > NotDetermined (1) > granted (0).
+        // When reminders=NotDetermined and events=Denied, hint should reflect
+        // the Denied state.
+        let hint = auth_remediation(
+            AuthorizationStatus::NotDetermined,
+            AuthorizationStatus::Denied,
+        )
+        .expect("expected remediation");
+        assert!(
+            hint.contains("System Settings") || hint.contains("tccutil"),
+            "Denied remediation should mention System Settings or tccutil; got: {hint}"
+        );
+    }
+
+    #[test]
+    fn auth_remediation_notdetermined_mentions_consent_dialog() {
+        let hint = auth_remediation(
+            AuthorizationStatus::NotDetermined,
+            AuthorizationStatus::NotDetermined,
+        )
+        .expect("expected remediation");
+        assert!(
+            hint.contains("consent dialog"),
+            "NotDetermined remediation should mention the consent dialog; got: {hint}"
+        );
+    }
+
+    #[test]
+    fn mcp_err_includes_remediation_hint_for_auth_variants() {
+        // The plain error message is just "Authorization denied"; mcp_err
+        // wraps it with actionable guidance for the agent. If this test
+        // breaks, the agent loses its diagnostic hint.
+        let err = mcp_err(&EventKitError::AuthorizationDenied);
+        assert!(
+            err.message.contains("System Settings") && err.message.contains("auth_status"),
+            "AuthorizationDenied should mention System Settings and the auth_status tool; got: {}",
+            err.message
+        );
+
+        let err = mcp_err(&EventKitError::AuthorizationNotDetermined);
+        assert!(
+            err.message.contains("Info.plist"),
+            "AuthorizationNotDetermined should hint at Info.plist usage strings; got: {}",
+            err.message
+        );
+
+        let err = mcp_err(&EventKitError::AuthorizationRestricted);
+        assert!(
+            err.message.contains("MDM") || err.message.contains("policy"),
+            "AuthorizationRestricted should mention policy/MDM; got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn mcp_err_passes_through_non_auth_errors() {
+        let err = mcp_err(&EventKitError::ItemNotFound("xyz".into()));
+        assert!(
+            err.message.contains("xyz"),
+            "non-auth errors should preserve the original message; got: {}",
+            err.message
+        );
+    }
 }
