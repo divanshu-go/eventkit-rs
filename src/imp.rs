@@ -2206,6 +2206,14 @@ impl EventsManager {
         status.into()
     }
 
+    /// Reset this event store so reads reflect the latest Calendar TCC state.
+    ///
+    /// Apple documents this as required when an event store was used to fetch
+    /// events before full access was granted (including write-only access).
+    pub fn reset(&self) {
+        unsafe { self.store.reset() };
+    }
+
     /// Requests full access to calendar events (blocking)
     ///
     /// Returns Ok(true) if access was granted, Ok(false) if denied
@@ -2240,7 +2248,12 @@ impl EventsManager {
         }
 
         match res.take() {
-            Some((granted, None)) => Ok(granted),
+            Some((granted, None)) => {
+                if granted {
+                    self.reset();
+                }
+                Ok(granted)
+            }
             Some((_, Some(error))) => Err(EventKitError::AuthorizationRequestFailed(error)),
             None => Err(EventKitError::AuthorizationRequestFailed(
                 "Unknown error".to_string(),
